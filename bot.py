@@ -280,17 +280,22 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 def main():
+    """Start the bot"""
     telegram_token = os.getenv("TELEGRAM_TOKEN")
     coc_api_token = os.getenv("COC_API_TOKEN")
     
     if not telegram_token or not coc_api_token:
         logger.error("Missing environment variables!")
+        print("Please set TELEGRAM_TOKEN and COC_API_TOKEN")
         return
     
     global tracker
     tracker = DonationTracker(coc_api_token)
     
+    # Create application
     application = Application.builder().token(telegram_token).build()
+    
+    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("donation", donation))
@@ -298,7 +303,11 @@ def main():
     application.add_handler(CommandHandler("checktags", checktags))
     
     logger.info("Bot started!")
-    application.run_polling()
+    
+    # Fix for Python 3.10+ async compatibility
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
