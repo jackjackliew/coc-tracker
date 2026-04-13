@@ -1,0 +1,8 @@
+.env
+donation_storage.json
+last_season_storage.json
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
