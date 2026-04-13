@@ -18,6 +18,7 @@ import requests
 import re
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 logging.basicConfig(
@@ -501,6 +502,23 @@ async def _send_chunks(target, text: str, reply_markup=None):
         await target.send_message(chunk, reply_markup=markup)
 
 
+async def _edit_message(query, text: str, reply_markup=None, parse_mode=None):
+    """Edit a callback message. Silently ignores Telegram's 'not modified' error
+    (happens when tapping the same button twice with identical content)."""
+    try:
+        kwargs = {}
+        if reply_markup:
+            kwargs["reply_markup"] = reply_markup
+        if parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        await query.edit_message_text(text, **kwargs)
+    except BadRequest as e:
+        if "not modified" in str(e).lower():
+            pass  # Content unchanged — silently ignore
+        else:
+            raise
+
+
 # ─── Command Handlers ─────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -523,9 +541,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            text, reply_markup=build_menu_keyboard(), parse_mode="Markdown"
-        )
+        await _edit_message(update.callback_query, text,
+                            reply_markup=build_menu_keyboard(), parse_mode="Markdown")
     else:
         await update.message.reply_text(text, reply_markup=build_menu_keyboard(), parse_mode="Markdown")
 
@@ -562,7 +579,7 @@ async def donation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = tracker.format_leaderboard(players)
 
         if is_cb:
-            await update.callback_query.edit_message_text(msg[:4096], reply_markup=build_menu_keyboard())
+            await _edit_message(update.callback_query, msg[:4096], reply_markup=build_menu_keyboard())
             if len(msg) > 4096:
                 await _send_chunks(update.effective_chat, msg[4096:])
         else:
@@ -572,7 +589,7 @@ async def donation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"/donation error: {e}")
         err = f"❌ Error: {e}"
         if is_cb:
-            await update.callback_query.edit_message_text(err, reply_markup=build_menu_keyboard())
+            await _edit_message(update.callback_query, err, reply_markup=build_menu_keyboard())
         else:
             await update.message.reply_text(err)
 
@@ -613,7 +630,7 @@ async def clanlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = "⏳ No sync data yet — please wait up to 10 seconds and try again."
 
         if is_cb:
-            await update.callback_query.edit_message_text(msg[:4096], reply_markup=build_menu_keyboard())
+            await _edit_message(update.callback_query, msg[:4096], reply_markup=build_menu_keyboard())
             if len(msg) > 4096:
                 await _send_chunks(update.effective_chat, msg[4096:])
         else:
@@ -623,7 +640,7 @@ async def clanlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"/clanlist error: {e}")
         err = f"❌ Error: {e}"
         if is_cb:
-            await update.callback_query.edit_message_text(err, reply_markup=build_menu_keyboard())
+            await _edit_message(update.callback_query, err, reply_markup=build_menu_keyboard())
         else:
             await update.message.reply_text(err)
 
@@ -648,7 +665,7 @@ async def lastseason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = tracker.format_leaderboard(players, title=title)
 
         if is_cb:
-            await update.callback_query.edit_message_text(msg[:4096], reply_markup=build_menu_keyboard())
+            await _edit_message(update.callback_query, msg[:4096], reply_markup=build_menu_keyboard())
         else:
             await _send_chunks(update.effective_chat, msg, reply_markup=build_menu_keyboard())
 
@@ -656,7 +673,7 @@ async def lastseason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"/lastseason error: {e}")
         err = f"❌ Error: {e}"
         if is_cb:
-            await update.callback_query.edit_message_text(err, reply_markup=build_menu_keyboard())
+            await _edit_message(update.callback_query, err, reply_markup=build_menu_keyboard())
         else:
             await update.message.reply_text(err)
 
@@ -685,9 +702,8 @@ async def checktags(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "\n".join(lines)
 
         if is_cb:
-            await update.callback_query.edit_message_text(
-                text, reply_markup=build_menu_keyboard(), parse_mode="Markdown"
-            )
+            await _edit_message(update.callback_query, text,
+                                reply_markup=build_menu_keyboard(), parse_mode="Markdown")
         else:
             await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -695,7 +711,7 @@ async def checktags(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"/checktags error: {e}")
         err = f"❌ Error: {e}"
         if is_cb:
-            await update.callback_query.edit_message_text(err, reply_markup=build_menu_keyboard())
+            await _edit_message(update.callback_query, err, reply_markup=build_menu_keyboard())
         else:
             await update.message.reply_text(err)
 
