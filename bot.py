@@ -4,15 +4,19 @@ import logging
 import requests
 import re
 from datetime import datetime, timedelta
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
 COC_API_BASE = "https://api.clashofclans.com/v1"
 STORAGE_FILE = os.path.join(os.path.dirname(__file__), "donation_storage.json")
 LAST_SEASON_FILE = os.path.join(os.path.dirname(__file__), "last_season_storage.json")
+POLL_INTERVAL = 10  # seconds between each CoC API sync
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -22,14 +26,28 @@ def get_current_season():
     return f"{now.year}-{now.month:02d}"
 
 
+def build_menu_keyboard():
+    """Inline button menu shown with /menu, /start, and after results."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏆 Donations", callback_data="donation"),
+            InlineKeyboardButton("📊 Clan List", callback_data="clanlist"),
+        ],
+        [
+            InlineKeyboardButton("📜 Last Season", callback_data="lastseason"),
+            InlineKeyboardButton("🔍 Check Tags", callback_data="checktags"),
+        ],
+    ])
+
+
 # ─── Storage ──────────────────────────────────────────────────────────────────
 
 class DonationStorage:
     """
-    Current-season storage schema:
+    Current-season storage schema (donation_storage.json):
     {
       "season": "2026-04",
-      "clan_tags": ["#TAG1", "#TAG2", ...],
+      "clan_tags": ["#TAG1", "#TAG2"],
       "players": {
         "#PLAYERTAG": {
           "name": "PlayerName",
@@ -45,12 +63,16 @@ class DonationStorage:
       "season": "2026-03",
       "expires_at": "2026-04-14T00:00:00",
       "players": {
-        "#PLAYERTAG": {
-          "name": "PlayerName",
-          "total": 1234
-        }
+        "#PLAYERTAG": {"name": "PlayerName", "total": 1234}
       }
     }
+
+    Donation counting rules:
+    - bonus: accumulated donations from previous clans or after rejoining same clan
+    - last_donations: current raw donations from CoC API
+    - total = bonus + last_donations
+    - If player moves to a different clan: bonus += last_donations, reset last_donations
+    - If player rejoins same clan (count drops to 0): bonus += last_donations, reset last_donations
     """
 
     def __init__(self):
@@ -73,13 +95,15 @@ class DonationStorage:
             logger.error(f"Failed to save storage: {e}")
 
     def _snapshot_to_last_season(self):
-        """Save current season final totals to last_season_storage.json with 2-week expiry."""
+        """Snapshot current season totals to last_season_storage.json with 2-week expiry."""
         players = self.data.get("players", {})
-        snapshot = {}
-        for tag, info in players.items():
-            total = info.get("bonus", 0) + info.get("last_donations", 0)
-            snapshot[tag] = {"name": info.get("name", "Unknown"), "total": total}
-
+        snapshot = {
+            tag: {
+                "name": info.get("name", "Unknown"),
+                "total": info.get("bonus", 0) + info.get("last_donations", 0),
+            }
+            for tag, info in players.items()
+        }
         expires_at = (datetime.now() + timedelta(weeks=2)).strftime("%Y-%m-%dT%H:%M:%S")
         last_season_data = {
             "season": self.data.get("season", "unknown"),
@@ -89,7 +113,7 @@ class DonationStorage:
         try:
             with open(LAST_SEASON_FILE, "w") as f:
                 json.dump(last_season_data, f, indent=2)
-            logger.info(f"Snapshotted last season {self.data['season']} — expires {expires_at}")
+            logger.info(f"Snapshotted season {self.data['season']} — expires {expires_at}")
         except Exception as e:
             logger.error(f"Failed to save last season: {e}")
 
@@ -129,12 +153,20 @@ class DonationStorage:
             stored["name"] = player_name
 
             if stored["last_clan"] != current_clan_tag:
-                # Player moved clan — carry over previous donations as bonus
+                # Player moved to a different clan — carry over donations as bonus
                 stored["bonus"] += stored["last_donations"]
                 stored["last_clan"] = current_clan_tag
                 stored["last_donations"] = current_donations
                 logger.info(
-                    f"{player_name} ({player_tag}) moved clan. "
+                    f"{player_name} ({player_tag}) moved to {current_clan_tag}. "
+                    f"Bonus now {stored['bonus']}, current {current_donations}"
+                )
+            elif current_donations < stored["last_donations"]:
+                # Same clan but count dropped — player left and rejoined (CoC resets their count)
+                stored["bonus"] += stored["last_donations"]
+                stored["last_donations"] = current_donations
+                logger.info(
+                    f"{player_name} ({player_tag}) rejoined {current_clan_tag}. "
                     f"Bonus now {stored['bonus']}, current {current_donations}"
                 )
             else:
@@ -144,11 +176,11 @@ class DonationStorage:
         return players[player_tag]["bonus"] + current_donations
 
     def silent_update(self, player_tag, player_name, current_donations, current_clan_tag):
-        """Background sync version — updates storage quietly without returning total."""
+        """Background sync version — updates storage without returning total."""
         self.update_and_get_total(player_tag, player_name, current_donations, current_clan_tag)
 
     def cleanup_last_season_if_expired(self):
-        """Auto-delete last season file if 2-week window has passed."""
+        """Auto-delete last season file after 2-week window."""
         if not os.path.exists(LAST_SEASON_FILE):
             return
         try:
@@ -202,18 +234,16 @@ class DonationTracker:
         self.storage = DonationStorage()
 
     def parse_clan_tags(self, description):
-        pattern = r'#[A-Z0-9]+'
-        tags = re.findall(pattern, description.upper())
-        seen = set()
-        unique_tags = []
+        tags = re.findall(r"#[A-Z0-9]+", description.upper())
+        seen, unique = set(), []
         for tag in tags:
             if tag not in seen:
                 seen.add(tag)
-                unique_tags.append(tag)
-        return unique_tags
+                unique.append(tag)
+        return unique
 
     def sync_all_clans(self, clan_tags):
-        """Poll all clans and update storage silently. Used by background job."""
+        """Poll all clans and silently update storage. Called by background job."""
         if not clan_tags:
             return
         seen_tags = set()
@@ -285,24 +315,25 @@ class DonationTracker:
         for idx, player in enumerate(players, 1):
             medal = medals.get(idx, "▫️")
             lines.append(f"{medal} {idx}. {player['name']} - {player['donations']:,}")
-        lines.append("")
-        lines.append(f"Last updated: {timestamp}")
-        return "\n".join(lines)
+        lines += ["", f"Last updated: {timestamp}"]
+        return "
+".join(lines)
 
     def format_by_clan(self, clan_tags):
-        lines = ["📊 Donations by Clan 📊", ""]
         timestamp = datetime.now().strftime("%-m/%-d/%Y, %-I:%M:%S %p")
         medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        lines = ["📊 Donations by Clan 📊", ""]
         for tag in clan_tags:
-            players, _ = self.get_clan_donations(tag)
+            players, clan_name = self.get_clan_donations(tag)
             if players:
-                lines.append(f"{tag}")
+                lines.append(f"🏰 {clan_name} ({tag})")
                 for idx, player in enumerate(players, 1):
                     medal = medals.get(idx, "▫️")
-                    lines.append(f"{medal} {player['name']} - {player['donations']:,}")
+                    lines.append(f"  {medal} {player['name']} - {player['donations']:,}")
                 lines.append("")
         lines.append(f"Last updated: {timestamp}")
-        return "\n".join(lines)
+        return "
+".join(lines)
 
     def get_last_season_leaderboard(self):
         """Read last_season_storage.json and return players, season name, days left."""
@@ -311,12 +342,10 @@ class DonationTracker:
         try:
             with open(LAST_SEASON_FILE, "r") as f:
                 data = json.load(f)
-
             expires_at = datetime.strptime(data["expires_at"], "%Y-%m-%dT%H:%M:%S")
             if datetime.now() >= expires_at:
                 os.remove(LAST_SEASON_FILE)
                 return None, None, None
-
             season = data.get("season", "unknown")
             players = [
                 {"name": info["name"], "donations": info["total"]}
@@ -325,32 +354,37 @@ class DonationTracker:
             players.sort(key=lambda x: x["donations"], reverse=True)
             days_left = (expires_at - datetime.now()).days
             return players, season, days_left
-
         except Exception as e:
             logger.error(f"Error reading last season: {e}")
             return None, None, None
 
 
-# ─── Background Sync Job ──────────────────────────────────────────────────────
+# ─── Background Sync ──────────────────────────────────────────────────────────
 
 async def background_sync(context):
-    """Called every 60 seconds by JobQueue to silently update donation storage."""
+    """Poll all clans every POLL_INTERVAL seconds and silently update donation storage."""
     clan_tags = tracker.storage.get_cached_clan_tags()
     if not clan_tags:
-        logger.info("Background sync skipped — no clan tags cached yet.")
+        logger.debug("Background sync skipped — no clan tags cached yet.")
         return
     tracker.sync_all_clans(clan_tags)
 
 
-# ─── Bot Handlers ─────────────────────────────────────────────────────────────
+# ─── Decorators & Helpers ─────────────────────────────────────────────────────
 
 tracker = None
 
 
 def group_only(func):
+    """Restrict command to group/supergroup chats only."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.type not in ["group", "supergroup"]:
-            await update.message.reply_text("❌ This command only works in the War Snipers group.")
+        chat_type = update.effective_chat.type if update.effective_chat else None
+        if chat_type not in ["group", "supergroup"]:
+            msg = "❌ This command only works in the War Snipers group."
+            if update.callback_query:
+                await update.callback_query.answer(msg, show_alert=True)
+            elif update.message:
+                await update.message.reply_text(msg)
             return
         await func(update, context)
     return wrapper
@@ -359,141 +393,255 @@ def group_only(func):
 async def get_clan_tags_from_chat(update, context):
     chat = await context.bot.get_chat(update.effective_chat.id)
     description = chat.description or ""
-    if not description:
-        return []
-    return tracker.parse_clan_tags(description)
+    return tracker.parse_clan_tags(description) if description else []
+
+
+async def _send_long_message(chat, text):
+    """Send a message, splitting at 4096 chars if needed."""
+    for i in range(0, len(text), 4096):
+        await chat.send_message(text[i:i + 4096])
+
+
+# ─── Command Handlers ─────────────────────────────────────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "👋 *War Snipers Donation Tracker*
+
+"
+        "Track clan donations across all War Snipers clans.
+"
+        "Tap a button below or type a command:")
+    await update.message.reply_text(text, reply_markup=build_menu_keyboard(), parse_mode="Markdown")
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📖 *Commands:*
+
+"
+        "🏆 /donation — Top donators across all clans
+"
+        "📊 /clanlist — Donations grouped by each clan
+"
+        "📜 /lastseason — Last season's records (kept 2 weeks)
+"
+        "🔍 /checktags — Verify which clans I'm tracking
+"
+        "📋 /menu — Show the button menu
+
+"
+        f"ℹ️ Data syncs every {POLL_INTERVAL}s automatically.
+"
+        "ℹ️ Moving between tracked clans will NOT reset your count.")
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            text, reply_markup=build_menu_keyboard(), parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(text, reply_markup=build_menu_keyboard(), parse_mode="Markdown")
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📋 Choose a command:", reply_markup=build_menu_keyboard())
 
 
 @group_only
 async def donation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Fetching global donation data...")
+    is_callback = bool(update.callback_query)
+    if is_callback:
+        await update.callback_query.answer("⏳ Fetching...")
+    else:
+        await update.message.reply_text("⏳ Fetching global donation data...")
+
     try:
         clan_tags = await get_clan_tags_from_chat(update, context)
         if not clan_tags:
-            await update.message.reply_text("❌ No clan tags found in group description.")
+            msg = "❌ No clan tags found in group description."
+            if is_callback:
+                await update.callback_query.edit_message_text(msg, reply_markup=build_menu_keyboard())
+            else:
+                await update.message.reply_text(msg)
             return
 
         tracker.storage.cache_clan_tags(clan_tags)
         players = tracker.get_all_donations(clan_tags)
-
         if not players:
-            await update.message.reply_text("❌ Could not fetch data.")
+            msg = "❌ Could not fetch donation data."
+            if is_callback:
+                await update.callback_query.edit_message_text(msg, reply_markup=build_menu_keyboard())
+            else:
+                await update.message.reply_text(msg)
             return
 
         message = tracker.format_leaderboard(players)
-        if len(message) > 4096:
-            for i in range(0, len(message), 4096):
-                await update.message.reply_text(message[i:i + 4096])
+        if is_callback:
+            text = message[:4096]
+            await update.callback_query.edit_message_text(text, reply_markup=build_menu_keyboard())
+            if len(message) > 4096:
+                await _send_long_message(update.effective_chat, message[4096:])
         else:
-            await update.message.reply_text(message)
+            await _send_long_message(update.effective_chat, message)
 
     except Exception as e:
         logger.error(f"Error in /donation: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+        err = f"❌ Error: {str(e)}"
+        if is_callback:
+            await update.callback_query.edit_message_text(err, reply_markup=build_menu_keyboard())
+        else:
+            await update.message.reply_text(err)
 
 
 @group_only
 async def clanlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Fetching clan data...")
+    is_callback = bool(update.callback_query)
+    if is_callback:
+        await update.callback_query.answer("⏳ Fetching...")
+    else:
+        await update.message.reply_text("⏳ Fetching clan data...")
+
     try:
         clan_tags = await get_clan_tags_from_chat(update, context)
         if not clan_tags:
-            await update.message.reply_text("❌ No clan tags found.")
+            msg = "❌ No clan tags found in group description."
+            if is_callback:
+                await update.callback_query.edit_message_text(msg, reply_markup=build_menu_keyboard())
+            else:
+                await update.message.reply_text(msg)
             return
 
         tracker.storage.cache_clan_tags(clan_tags)
         message = tracker.format_by_clan(clan_tags)
-
-        if len(message) > 4096:
-            parts = []
-            current_part = ""
-            for line in message.split("\n"):
-                if len(current_part) + len(line) + 1 > 4096:
-                    parts.append(current_part)
-                    current_part = line + "\n"
-                else:
-                    current_part += line + "\n"
-            if current_part:
-                parts.append(current_part)
-            for part in parts:
-                await update.message.reply_text(part)
+        if is_callback:
+            text = message[:4096]
+            await update.callback_query.edit_message_text(text, reply_markup=build_menu_keyboard())
+            if len(message) > 4096:
+                await _send_long_message(update.effective_chat, message[4096:])
         else:
-            await update.message.reply_text(message)
+            # Split on clan boundaries to avoid breaking mid-clan
+            if len(message) <= 4096:
+                await update.message.reply_text(message)
+            else:
+                parts, current = [], ""
+                for line in message.split("
+"):
+                    if len(current) + len(line) + 1 > 4096:
+                        parts.append(current.rstrip())
+                        current = line + "
+"
+                    else:
+                        current += line + "
+"
+                if current:
+                    parts.append(current.rstrip())
+                for part in parts:
+                    await update.message.reply_text(part)
 
     except Exception as e:
         logger.error(f"Error in /clanlist: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+        err = f"❌ Error: {str(e)}"
+        if is_callback:
+            await update.callback_query.edit_message_text(err, reply_markup=build_menu_keyboard())
+        else:
+            await update.message.reply_text(err)
 
 
 @group_only
 async def lastseason(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show last season's final donation leaderboard (available for 2 weeks after season end)."""
+    is_callback = bool(update.callback_query)
+    if is_callback:
+        await update.callback_query.answer()
+
     try:
         players, season, days_left = tracker.get_last_season_leaderboard()
-
         if players is None:
-            await update.message.reply_text(
-                "❌ No last season data available.\n"
-                "Last season records are kept for 2 weeks after the season ends."
+            msg = (
+                "❌ No last season data available.
+"
+                "Records are kept for 2 weeks after the season ends."
             )
+            if is_callback:
+                await update.callback_query.edit_message_text(msg, reply_markup=build_menu_keyboard())
+            else:
+                await update.message.reply_text(msg)
             return
 
-        title = f"📜 Last Season ({season}) Final Donations 📜\n⏳ Records expire in {days_left} day(s)"
+        title = f"📜 Last Season ({season}) Final Donations 📜
+⏳ Records expire in {days_left} day(s)"
         message = tracker.format_leaderboard(players, title=title)
-
-        if len(message) > 4096:
-            for i in range(0, len(message), 4096):
-                await update.message.reply_text(message[i:i + 4096])
+        if is_callback:
+            text = message[:4096]
+            await update.callback_query.edit_message_text(text, reply_markup=build_menu_keyboard())
         else:
-            await update.message.reply_text(message)
+            await _send_long_message(update.effective_chat, message)
 
     except Exception as e:
         logger.error(f"Error in /lastseason: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+        err = f"❌ Error: {str(e)}"
+        if is_callback:
+            await update.callback_query.edit_message_text(err, reply_markup=build_menu_keyboard())
+        else:
+            await update.message.reply_text(err)
 
 
 @group_only
 async def checktags(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    is_callback = bool(update.callback_query)
+    if is_callback:
+        await update.callback_query.answer("🔍 Checking...")
+
     try:
         clan_tags = await get_clan_tags_from_chat(update, context)
         if not clan_tags:
-            await update.message.reply_text("❌ No clan tags found.")
+            msg = "❌ No clan tags found in group description."
+            if is_callback:
+                await update.callback_query.edit_message_text(msg, reply_markup=build_menu_keyboard())
+            else:
+                await update.message.reply_text(msg)
             return
 
-        lines = ["📋 Detected Clan Tags:", ""]
+        lines = ["📋 *Detected Clan Tags:*", ""]
         for tag in clan_tags:
             clan_info = tracker.api.get_clan_info(tag)
-            name = clan_info.get("name", "Unknown") if clan_info else "Unknown"
-            lines.append(f"▫️ {tag} ({name})")
+            name = clan_info.get("name", "Unknown") if clan_info else "❌ Unreachable"
+            lines.append(f"▫️ {tag} — {name}")
+        text = "
+".join(lines)
 
-        await update.message.reply_text("\n".join(lines))
+        if is_callback:
+            await update.callback_query.edit_message_text(
+                text, reply_markup=build_menu_keyboard(), parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(text, parse_mode="Markdown")
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+        logger.error(f"Error in /checktags: {e}")
+        err = f"❌ Error: {str(e)}"
+        if is_callback:
+            await update.callback_query.edit_message_text(err, reply_markup=build_menu_keyboard())
+        else:
+            await update.message.reply_text(err)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 War Snipers Donation Tracker\n\n"
-        "Commands:\n"
-        "/donation - Global top donators (all clans combined)\n"
-        "/clanlist - Donations grouped by clan\n"
-        "/lastseason - Last season's final donation records\n"
-        "/checktags - Verify detected clans\n"
-        "/help - Show help"
-    )
+# ─── Callback Query Router ────────────────────────────────────────────────────
+
+CALLBACK_MAP = {
+    "donation": donation,
+    "clanlist": clanlist,
+    "lastseason": lastseason,
+    "checktags": checktags,
+}
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 Commands:\n\n"
-        "/donation - Top donators across all clans (combined rank)\n"
-        "/clanlist - Donations grouped by each clan\n"
-        "/lastseason - Last season's final records (kept 2 weeks)\n"
-        "/checktags - See which clans I'm tracking\n\n"
-        "ℹ️ Donations are synced every minute automatically.\n"
-        "ℹ️ Moving between the 5 clans will not reset your donation count."
-    )
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    handler = CALLBACK_MAP.get(query.data)
+    if handler:
+        await handler(update, context)
+    else:
+        await query.answer("Unknown action.")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -503,8 +651,7 @@ def main():
     coc_api_token = os.getenv("COC_API_TOKEN")
 
     if not telegram_token or not coc_api_token:
-        logger.error("Missing environment variables!")
-        print("Please set TELEGRAM_TOKEN and COC_API_TOKEN")
+        logger.error("Missing TELEGRAM_TOKEN or COC_API_TOKEN environment variables.")
         return
 
     global tracker
@@ -514,18 +661,17 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("menu", menu))
     application.add_handler(CommandHandler("donation", donation))
     application.add_handler(CommandHandler("clanlist", clanlist))
     application.add_handler(CommandHandler("lastseason", lastseason))
     application.add_handler(CommandHandler("checktags", checktags))
+    application.add_handler(CallbackQueryHandler(button_handler))
 
-    # Background sync every 60 seconds, starts 10 seconds after bot launch
-    application.job_queue.run_repeating(background_sync, interval=60, first=10)
+    # Poll CoC API every POLL_INTERVAL seconds, starting 5 seconds after launch
+    application.job_queue.run_repeating(background_sync, interval=POLL_INTERVAL, first=5)
 
-    logger.info("Bot started! Background sync active every 60 seconds.")
-
-    import asyncio
-    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+    logger.info(f"Bot started. Background sync every {POLL_INTERVAL}s.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
