@@ -1,0 +1,19 @@
+[Unit]
+Description=War Snipers CoC Donation Tracker Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/coc-tracker
+EnvironmentFile=/home/ubuntu/coc-tracker/.env
+ExecStart=/home/ubuntu/coc-tracker/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coc-tracker
+
+[Install]
+WantedBy=multi-user.target
