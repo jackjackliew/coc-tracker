@@ -1,3 +1,15 @@
+"""
+War Snipers CoC Donation Tracker
+=================================
+Tracks cumulative donations across all War Snipers clans.
+Members can freely jump between any of the 5 clans — all donations add up correctly.
+
+Key guarantees:
+  - Every donation is captured regardless of how many clans a member jumps through
+  - Season boundaries match CoC exactly (goldpass API), with calendar month as fallback
+  - Efficient: single disk write per 10s sync cycle, not per member
+"""
+
 import os
 import json
 import logging
@@ -16,18 +28,11 @@ logger = logging.getLogger(__name__)
 COC_API_BASE = "https://api.clashofclans.com/v1"
 STORAGE_FILE = os.path.join(os.path.dirname(__file__), "donation_storage.json")
 LAST_SEASON_FILE = os.path.join(os.path.dirname(__file__), "last_season_storage.json")
-POLL_INTERVAL = 10  # seconds between each CoC API sync
-
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def get_current_season():
-    now = datetime.now()
-    return f"{now.year}-{now.month:02d}"
+POLL_INTERVAL = 10           # seconds between background syncs
+SEASON_CHECK_INTERVAL = 600  # seconds between CoC season boundary checks (10 min)
 
 
 def build_menu_keyboard():
-    """Inline button menu shown with /menu, /start, and after results."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🏆 Donations", callback_data="donation"),
@@ -44,299 +49,187 @@ def build_menu_keyboard():
 
 class DonationStorage:
     """
-    Current-season storage schema (donation_storage.json):
+    Manages all donation state on disk.
+
+    Schema (donation_storage.json):
     {
-      "season": "2026-04",
-      "clan_tags": ["#TAG1", "#TAG2"],
+      "season_key": "20260401",    ← CoC season start date from goldpass API (YYYYMMDD)
+      "clan_tags": ["#TAG1", ...],
       "players": {
         "#PLAYERTAG": {
-          "name": "PlayerName",
-          "bonus": 1234,
-          "last_clan": "#CLANTAG",
-          "last_donations": 567
+          "name":           "PlayerName",
+          "bonus":          1000,   ← donations locked in from all previous clan visits
+          "last_clan":      "#TAG", ← last clan we saw this member in
+          "last_donations": 250     ← their current API count in last_clan
         }
       }
     }
 
-    Last-season storage schema (last_season_storage.json):
-    {
-      "season": "2026-03",
-      "expires_at": "2026-04-14T00:00:00",
-      "players": {
-        "#PLAYERTAG": {"name": "PlayerName", "total": 1234}
-      }
-    }
+    Season total for a member = bonus + last_donations
 
-    Donation counting rules:
-    - bonus: accumulated donations from previous clans or after rejoining same clan
-    - last_donations: current raw donations from CoC API
-    - total = bonus + last_donations
-    - If player moves to a different clan: bonus += last_donations, reset last_donations
-    - If player rejoins same clan (count drops to 0): bonus += last_donations, reset last_donations
+    Three cases handled on every member update:
+      1. Different clan seen        → bonus += last_donations (lock in old clan's count)
+      2. Same clan, count DROPPED   → bonus += last_donations (member left and rejoined,
+                                      CoC resets their count to 0 on rejoin)
+      3. Same clan, count SAME/UP   → normal update, just store the new count
     """
 
     def __init__(self):
         self.data = self._load()
+        self._dirty = False
 
     def _load(self):
         if os.path.exists(STORAGE_FILE):
             try:
                 with open(STORAGE_FILE, "r") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {"season": get_current_season(), "clan_tags": [], "players": {}}
+                    data = json.load(f)
+                # Migrate old format: "season": "2026-04" → "season_key": "20260401"
+                if "season" in data and "season_key" not in data:
+                    old = data.pop("season", "")
+                    try:
+                        year, month = old.split("-")
+                        data["season_key"] = f"{year}{month}01"
+                    except Exception:
+                        data["season_key"] = datetime.now().strftime("%Y%m01")
+                    logger.info(f"Storage migrated to season_key: {data['season_key']}")
+                return data
+            except Exception as e:
+                logger.error(f"Failed to load storage, starting fresh: {e}")
+        return {"season_key": "", "clan_tags": [], "players": {}}
 
-    def _save(self):
+    def flush(self):
+        """Write to disk only when data has actually changed since last flush."""
+        if not self._dirty:
+            return
         try:
             with open(STORAGE_FILE, "w") as f:
                 json.dump(self.data, f, indent=2)
+            self._dirty = False
         except Exception as e:
             logger.error(f"Failed to save storage: {e}")
 
+    # ── Season management ──────────────────────────────────────────────────────
+
+    def handle_season_change(self, new_season_key: str):
+        """
+        Called with the current CoC season key (from goldpass API or fallback).
+        If the key has changed, snapshot the old season and start fresh.
+        No-op if season key is unchanged — safe to call on every sync.
+        """
+        if self.data.get("season_key") == new_season_key:
+            return  # Same season — nothing to do
+
+        old_key = self.data.get("season_key", "none")
+        logger.info(f"Season changed: {old_key} → {new_season_key}. Snapshotting...")
+
+        if self.data.get("players"):
+            self._snapshot_to_last_season()
+
+        self.data = {
+            "season_key": new_season_key,
+            "clan_tags": self.data.get("clan_tags", []),
+            "players": {},
+        }
+        self._dirty = True
+        self.flush()  # Immediate flush on season change
+
     def _snapshot_to_last_season(self):
-        """Snapshot current season totals to last_season_storage.json with 2-week expiry."""
-        players = self.data.get("players", {})
+        """Save final season totals to last_season_storage.json (kept 2 weeks)."""
         snapshot = {
             tag: {
                 "name": info.get("name", "Unknown"),
                 "total": info.get("bonus", 0) + info.get("last_donations", 0),
             }
-            for tag, info in players.items()
+            for tag, info in self.data.get("players", {}).items()
         }
         expires_at = (datetime.now() + timedelta(weeks=2)).strftime("%Y-%m-%dT%H:%M:%S")
-        last_season_data = {
-            "season": self.data.get("season", "unknown"),
-            "expires_at": expires_at,
-            "players": snapshot,
-        }
         try:
             with open(LAST_SEASON_FILE, "w") as f:
-                json.dump(last_season_data, f, indent=2)
-            logger.info(f"Snapshotted season {self.data['season']} — expires {expires_at}")
+                json.dump({
+                    "season_key": self.data.get("season_key", ""),
+                    "expires_at": expires_at,
+                    "players": snapshot,
+                }, f, indent=2)
+            logger.info(f"Season snapshot saved, expires {expires_at}")
         except Exception as e:
-            logger.error(f"Failed to save last season: {e}")
+            logger.error(f"Failed to write season snapshot: {e}")
 
-    def _check_season_reset(self):
-        """Detect new season, snapshot old data, then reset."""
-        current = get_current_season()
-        if self.data.get("season") != current:
-            logger.info(f"New season detected: {current}. Snapshotting old season...")
-            self._snapshot_to_last_season()
-            cached_tags = self.data.get("clan_tags", [])
-            self.data = {"season": current, "clan_tags": cached_tags, "players": {}}
-            self._save()
+    # ── Clan tag caching ───────────────────────────────────────────────────────
 
-    def cache_clan_tags(self, clan_tags):
-        """Store clan tags so background sync knows which clans to poll."""
+    def cache_clan_tags(self, clan_tags: list):
         if set(clan_tags) != set(self.data.get("clan_tags", [])):
-            self.data["clan_tags"] = clan_tags
-            self._save()
+            self.data["clan_tags"] = list(clan_tags)
+            self._dirty = True
 
-    def get_cached_clan_tags(self):
+    def get_cached_clan_tags(self) -> list:
         return self.data.get("clan_tags", [])
 
-    def update_and_get_total(self, player_tag, player_name, current_donations, current_clan_tag):
-        """Update player record and return their season total."""
-        self._check_season_reset()
+    # ── Player donation updates ────────────────────────────────────────────────
+
+    def update_player(self, player_tag: str, player_name: str,
+                      current_donations: int, current_clan_tag: str) -> int:
+        """
+        Update one player's donation record. Returns their season total.
+        Does NOT flush to disk — caller must call flush() after a full batch.
+        """
         players = self.data["players"]
 
         if player_tag not in players:
+            # First time we see this player this season
             players[player_tag] = {
                 "name": player_name,
                 "bonus": 0,
                 "last_clan": current_clan_tag,
                 "last_donations": current_donations,
             }
+            self._dirty = True
         else:
-            stored = players[player_tag]
-            stored["name"] = player_name
+            p = players[player_tag]
+            changed = False
 
-            if stored["last_clan"] != current_clan_tag:
-                # Player moved to a different clan — carry over donations as bonus
-                stored["bonus"] += stored["last_donations"]
-                stored["last_clan"] = current_clan_tag
-                stored["last_donations"] = current_donations
-                logger.info(
-                    f"{player_name} ({player_tag}) moved to {current_clan_tag}. "
-                    f"Bonus now {stored['bonus']}, current {current_donations}"
-                )
-            elif current_donations < stored["last_donations"]:
-                # Same clan but count dropped — player left and rejoined (CoC resets their count)
-                stored["bonus"] += stored["last_donations"]
-                stored["last_donations"] = current_donations
-                logger.info(
-                    f"{player_name} ({player_tag}) rejoined {current_clan_tag}. "
-                    f"Bonus now {stored['bonus']}, current {current_donations}"
-                )
-            else:
-                stored["last_donations"] = current_donations
+            if p.get("name") != player_name:
+                p["name"] = player_name
+                changed = True
 
-        self._save()
+            if p["last_clan"] != current_clan_tag:
+                # ── Case 1: Member moved to a different clan ─────────────────
+                # Lock their previous clan's count into bonus, start tracking fresh.
+                p["bonus"] += p["last_donations"]
+                p["last_clan"] = current_clan_tag
+                p["last_donations"] = current_donations
+                logger.info(
+                    f"[CLAN MOVE]  {player_name} → {current_clan_tag} | "
+                    f"bonus={p['bonus']}, new count={current_donations}"
+                )
+                changed = True
+
+            elif current_donations < p["last_donations"]:
+                # ── Case 2: Same clan, count dropped ────────────────────────
+                # Member left and rejoined the same clan. CoC resets their
+                # donation count to 0 on every rejoin, so a lower count
+                # on the same clan means they completed a leave-rejoin cycle.
+                p["bonus"] += p["last_donations"]
+                p["last_donations"] = current_donations
+                logger.info(
+                    f"[REJOIN]     {player_name} rejoined {current_clan_tag} | "
+                    f"bonus={p['bonus']}, new count={current_donations}"
+                )
+                changed = True
+
+            elif current_donations != p["last_donations"]:
+                # ── Case 3: Normal donation increase ────────────────────────
+                p["last_donations"] = current_donations
+                changed = True
+
+            if changed:
+                self._dirty = True
+
         return players[player_tag]["bonus"] + current_donations
 
-    def silent_update(self, player_tag, player_name, current_donations, current_clan_tag):
-        """Background sync version — updates storage without returning total."""
-        self.update_and_get_total(player_tag, player_name, current_donations, current_clan_tag)
+    # ── Last season ────────────────────────────────────────────────────────────
 
-    def cleanup_last_season_if_expired(self):
-        """Auto-delete last season file after 2-week window."""
-        if not os.path.exists(LAST_SEASON_FILE):
-            return
-        try:
-            with open(LAST_SEASON_FILE, "r") as f:
-                data = json.load(f)
-            expires_at = datetime.strptime(data["expires_at"], "%Y-%m-%dT%H:%M:%S")
-            if datetime.now() >= expires_at:
-                os.remove(LAST_SEASON_FILE)
-                logger.info("Last season storage expired and removed.")
-        except Exception as e:
-            logger.error(f"Error during last season cleanup: {e}")
-
-
-# ─── CoC API ──────────────────────────────────────────────────────────────────
-
-class ClashAPI:
-    def __init__(self, token):
-        self.headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-
-    def get_clan_members(self, clan_tag):
-        encoded_tag = clan_tag.replace("#", "%23")
-        url = f"{COC_API_BASE}/clans/{encoded_tag}/members"
-        try:
-            response = requests.get(url, headers=self.headers, timeout=10)
-            if response.status_code == 200:
-                return response.json()
-            logger.error(f"API Error {response.status_code} for {clan_tag}")
-            return None
-        except Exception as e:
-            logger.error(f"Request failed for {clan_tag}: {e}")
-            return None
-
-    def get_clan_info(self, clan_tag):
-        encoded_tag = clan_tag.replace("#", "%23")
-        url = f"{COC_API_BASE}/clans/{encoded_tag}"
-        try:
-            response = requests.get(url, headers=self.headers, timeout=10)
-            if response.status_code == 200:
-                return response.json()
-            return None
-        except Exception as e:
-            logger.error(f"Error fetching clan info: {e}")
-            return None
-
-
-# ─── Tracker ──────────────────────────────────────────────────────────────────
-
-class DonationTracker:
-    def __init__(self, api_token):
-        self.api = ClashAPI(api_token)
-        self.storage = DonationStorage()
-
-    def parse_clan_tags(self, description):
-        tags = re.findall(r"#[A-Z0-9]+", description.upper())
-        seen, unique = set(), []
-        for tag in tags:
-            if tag not in seen:
-                seen.add(tag)
-                unique.append(tag)
-        return unique
-
-    def sync_all_clans(self, clan_tags):
-        """Poll all clans and silently update storage. Called by background job."""
-        if not clan_tags:
-            return
-        seen_tags = set()
-        for clan_tag in clan_tags:
-            data = self.api.get_clan_members(clan_tag)
-            if not data or "items" not in data:
-                continue
-            for member in data["items"]:
-                player_tag = member.get("tag", "")
-                if player_tag in seen_tags:
-                    continue
-                seen_tags.add(player_tag)
-                self.storage.silent_update(
-                    player_tag,
-                    member.get("name", "Unknown"),
-                    member.get("donations", 0),
-                    clan_tag,
-                )
-        self.storage.cleanup_last_season_if_expired()
-        logger.info(f"Background sync complete — {len(seen_tags)} players updated.")
-
-    def get_all_donations(self, clan_tags):
-        seen_tags = set()
-        all_players = []
-        for clan_tag in clan_tags:
-            data = self.api.get_clan_members(clan_tag)
-            if not data or "items" not in data:
-                continue
-            for member in data["items"]:
-                player_tag = member.get("tag", "")
-                if player_tag in seen_tags:
-                    continue
-                seen_tags.add(player_tag)
-                total = self.storage.update_and_get_total(
-                    player_tag,
-                    member.get("name", "Unknown"),
-                    member.get("donations", 0),
-                    clan_tag,
-                )
-                all_players.append({"name": member.get("name", "Unknown"), "donations": total})
-        all_players.sort(key=lambda x: x["donations"], reverse=True)
-        return all_players
-
-    def get_clan_donations(self, clan_tag):
-        clan_info = self.api.get_clan_info(clan_tag)
-        members_data = self.api.get_clan_members(clan_tag)
-        if not members_data or "items" not in members_data:
-            return None, None
-        clan_name = clan_info.get("name", "Unknown Clan") if clan_info else "Unknown Clan"
-        players = []
-        for member in members_data["items"]:
-            player_tag = member.get("tag", "")
-            total = self.storage.update_and_get_total(
-                player_tag,
-                member.get("name", "Unknown"),
-                member.get("donations", 0),
-                clan_tag,
-            )
-            players.append({"name": member.get("name", "Unknown"), "donations": total})
-        players.sort(key=lambda x: x["donations"], reverse=True)
-        return players, clan_name
-
-    def format_leaderboard(self, players, title="🏆 Top Donators This Season 🏆"):
-        if not players:
-            return "❌ No donation data found."
-        timestamp = datetime.now().strftime("%-m/%-d/%Y, %-I:%M:%S %p")
-        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-        lines = [title, ""]
-        for idx, player in enumerate(players, 1):
-            medal = medals.get(idx, "▫️")
-            lines.append(f"{medal} {idx}. {player['name']} - {player['donations']:,}")
-        lines += ["", f"Last updated: {timestamp}"]
-        return "
-".join(lines)
-
-    def format_by_clan(self, clan_tags):
-        timestamp = datetime.now().strftime("%-m/%-d/%Y, %-I:%M:%S %p")
-        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-        lines = ["📊 Donations by Clan 📊", ""]
-        for tag in clan_tags:
-            players, clan_name = self.get_clan_donations(tag)
-            if players:
-                lines.append(f"🏰 {clan_name} ({tag})")
-                for idx, player in enumerate(players, 1):
-                    medal = medals.get(idx, "▫️")
-                    lines.append(f"  {medal} {player['name']} - {player['donations']:,}")
-                lines.append("")
-        lines.append(f"Last updated: {timestamp}")
-        return "
-".join(lines)
-
-    def get_last_season_leaderboard(self):
-        """Read last_season_storage.json and return players, season name, days left."""
+    def get_last_season(self):
+        """Returns (players_list, season_label, days_left) or (None, None, None)."""
         if not os.path.exists(LAST_SEASON_FILE):
             return None, None, None
         try:
@@ -346,23 +239,214 @@ class DonationTracker:
             if datetime.now() >= expires_at:
                 os.remove(LAST_SEASON_FILE)
                 return None, None, None
-            season = data.get("season", "unknown")
-            players = [
-                {"name": info["name"], "donations": info["total"]}
-                for info in data["players"].values()
-            ]
-            players.sort(key=lambda x: x["donations"], reverse=True)
-            days_left = (expires_at - datetime.now()).days
-            return players, season, days_left
+            players = sorted(
+                [{"name": v["name"], "donations": v["total"]} for v in data["players"].values()],
+                key=lambda x: x["donations"], reverse=True,
+            )
+            season_key = data.get("season_key", "")
+            try:
+                season_label = datetime.strptime(season_key, "%Y%m%d").strftime("%B %Y")
+            except Exception:
+                season_label = season_key
+            days_left = max(0, (expires_at - datetime.now()).days)
+            return players, season_label, days_left
         except Exception as e:
             logger.error(f"Error reading last season: {e}")
             return None, None, None
+
+    def cleanup_last_season_if_expired(self):
+        self.get_last_season()  # Handles deletion internally when expired
+
+
+# ─── CoC API ──────────────────────────────────────────────────────────────────
+
+class ClashAPI:
+    def __init__(self, token: str):
+        self.headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+    def _get(self, url: str):
+        try:
+            r = requests.get(url, headers=self.headers, timeout=10)
+            return r.json() if r.status_code == 200 else None
+        except Exception as e:
+            logger.warning(f"GET failed [{url}]: {e}")
+            return None
+
+    def get_clan_members(self, clan_tag: str):
+        return self._get(f"{COC_API_BASE}/clans/{clan_tag.replace('#', '%23')}/members")
+
+    def get_clan_info(self, clan_tag: str):
+        return self._get(f"{COC_API_BASE}/clans/{clan_tag.replace('#', '%23')}")
+
+    def get_season_key(self):
+        """
+        Returns current CoC season start date as "YYYYMMDD" (e.g. "20260401").
+        CoC seasons end on the last Monday of the month — NOT the 1st.
+        Using the goldpass API prevents us from mis-detecting the CoC season
+        reset as members "rejoining" their clan during the calendar-month gap.
+        Returns None if API is unavailable.
+        """
+        data = self._get(f"{COC_API_BASE}/goldpass/seasons/current")
+        if data and "startTime" in data:
+            try:
+                return data["startTime"][:8]  # "20260401T000000.000Z" → "20260401"
+            except Exception:
+                pass
+        return None
+
+
+# ─── Tracker ──────────────────────────────────────────────────────────────────
+
+class DonationTracker:
+    def __init__(self, api_token: str):
+        self.api = ClashAPI(api_token)
+        self.storage = DonationStorage()
+        self._last_season_check = datetime.min  # Force a check on very first sync
+
+    def _refresh_season_if_due(self):
+        """
+        Check CoC goldpass API every SEASON_CHECK_INTERVAL seconds.
+        If the API is down, keep the stored season key to avoid false resets.
+        """
+        now = datetime.now()
+        if (now - self._last_season_check).total_seconds() < SEASON_CHECK_INTERVAL:
+            return
+        self._last_season_check = now
+
+        season_key = self.api.get_season_key()
+        if season_key:
+            self.storage.handle_season_change(season_key)
+        else:
+            # API unavailable — retain stored key; fall back to calendar month only
+            # if we have no stored key at all (e.g. fresh install).
+            fallback = self.storage.data.get("season_key") or datetime.now().strftime("%Y%m01")
+            logger.warning(f"Goldpass API unavailable, retaining season key: {fallback}")
+            self.storage.handle_season_change(fallback)
+
+    def parse_clan_tags(self, description: str) -> list:
+        tags = re.findall(r"#[A-Z0-9]+", description.upper())
+        seen, unique = set(), []
+        for tag in tags:
+            if tag not in seen:
+                seen.add(tag)
+                unique.append(tag)
+        return unique
+
+    def sync_all_clans(self, clan_tags: list):
+        """
+        Background sync: poll every clan and update all member records.
+        Season check happens once per SEASON_CHECK_INTERVAL, not per member.
+        Single disk write per sync cycle (not per member).
+        """
+        if not clan_tags:
+            return
+
+        self._refresh_season_if_due()  # Once per sync, not per member
+
+        seen_players = set()
+        for clan_tag in clan_tags:
+            data = self.api.get_clan_members(clan_tag)
+            if not data or "items" not in data:
+                continue
+            for member in data["items"]:
+                player_tag = member.get("tag", "")
+                if player_tag in seen_players:
+                    continue
+                seen_players.add(player_tag)
+                self.storage.update_player(
+                    player_tag,
+                    member.get("name", "Unknown"),
+                    member.get("donations", 0),
+                    clan_tag,
+                )
+
+        self.storage.flush()  # ONE disk write for the entire sync cycle
+        self.storage.cleanup_last_season_if_expired()
+        logger.debug(f"Sync complete — {len(seen_players)} players updated.")
+
+    def get_all_donations(self, clan_tags: list) -> list:
+        """Fetch fresh data and return global donation leaderboard."""
+        self._refresh_season_if_due()
+        seen_players = set()
+        players = []
+        for clan_tag in clan_tags:
+            data = self.api.get_clan_members(clan_tag)
+            if not data or "items" not in data:
+                continue
+            for member in data["items"]:
+                player_tag = member.get("tag", "")
+                if player_tag in seen_players:
+                    continue
+                seen_players.add(player_tag)
+                total = self.storage.update_player(
+                    player_tag,
+                    member.get("name", "Unknown"),
+                    member.get("donations", 0),
+                    clan_tag,
+                )
+                players.append({"name": member.get("name", "Unknown"), "donations": total})
+        self.storage.flush()
+        players.sort(key=lambda x: x["donations"], reverse=True)
+        return players
+
+    def get_all_by_clan(self, clan_tags: list) -> list:
+        """
+        Fetch fresh data for each clan.
+        Returns list of (clan_name, clan_tag, players).
+        Single flush after all clans processed.
+        """
+        self._refresh_season_if_due()
+        results = []
+        for clan_tag in clan_tags:
+            clan_info = self.api.get_clan_info(clan_tag)
+            members_data = self.api.get_clan_members(clan_tag)
+            if not members_data or "items" not in members_data:
+                continue
+            clan_name = clan_info.get("name", "Unknown Clan") if clan_info else "Unknown Clan"
+            players = []
+            for member in members_data["items"]:
+                player_tag = member.get("tag", "")
+                total = self.storage.update_player(
+                    player_tag,
+                    member.get("name", "Unknown"),
+                    member.get("donations", 0),
+                    clan_tag,
+                )
+                players.append({"name": member.get("name", "Unknown"), "donations": total})
+            players.sort(key=lambda x: x["donations"], reverse=True)
+            results.append((clan_name, clan_tag, players))
+        self.storage.flush()  # One flush after all clans
+        return results
+
+    # ── Formatters ─────────────────────────────────────────────────────────────
+
+    def format_leaderboard(self, players: list, title: str = "🏆 Top Donators This Season 🏆") -> str:
+        if not players:
+            return "❌ No donation data found."
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        ts = datetime.now().strftime("%-m/%-d/%Y, %-I:%M:%S %p")
+        lines = [title, ""]
+        for i, p in enumerate(players, 1):
+            lines.append(f"{medals.get(i, '▫️')} {i}. {p['name']} — {p['donations']:,}")
+        lines += ["", f"Last updated: {ts}"]
+        return "\n".join(lines)
+
+    def format_by_clan(self, clan_tags: list) -> str:
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        ts = datetime.now().strftime("%-m/%-d/%Y, %-I:%M:%S %p")
+        lines = ["📊 Donations by Clan 📊", ""]
+        for clan_name, clan_tag, players in self.get_all_by_clan(clan_tags):
+            lines.append(f"🏰 {clan_name} ({clan_tag})")
+            for i, p in enumerate(players, 1):
+                lines.append(f"  {medals.get(i, '▫️')} {p['name']} — {p['donations']:,}")
+            lines.append("")
+        lines.append(f"Last updated: {ts}")
+        return "\n".join(lines)
 
 
 # ─── Background Sync ──────────────────────────────────────────────────────────
 
 async def background_sync(context):
-    """Poll all clans every POLL_INTERVAL seconds and silently update donation storage."""
     clan_tags = tracker.storage.get_cached_clan_tags()
     if not clan_tags:
         logger.debug("Background sync skipped — no clan tags cached yet.")
@@ -370,13 +454,13 @@ async def background_sync(context):
     tracker.sync_all_clans(clan_tags)
 
 
-# ─── Decorators & Helpers ─────────────────────────────────────────────────────
+# ─── Bot Wiring ───────────────────────────────────────────────────────────────
 
 tracker = None
 
 
 def group_only(func):
-    """Restrict command to group/supergroup chats only."""
+    """Restrict a command handler to group/supergroup chats."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_type = update.effective_chat.type if update.effective_chat else None
         if chat_type not in ["group", "supergroup"]:
@@ -390,50 +474,39 @@ def group_only(func):
     return wrapper
 
 
-async def get_clan_tags_from_chat(update, context):
+async def get_clan_tags_from_chat(update, context) -> list:
     chat = await context.bot.get_chat(update.effective_chat.id)
-    description = chat.description or ""
-    return tracker.parse_clan_tags(description) if description else []
+    return tracker.parse_clan_tags(chat.description or "")
 
 
-async def _send_long_message(chat, text):
-    """Send a message, splitting at 4096 chars if needed."""
-    for i in range(0, len(text), 4096):
-        await chat.send_message(text[i:i + 4096])
+async def _send_chunks(target, text: str, reply_markup=None):
+    """Send text, splitting at 4096 chars. Keyboard attached to last chunk only."""
+    chunks = [text[i:i + 4096] for i in range(0, len(text), 4096)]
+    for i, chunk in enumerate(chunks):
+        markup = reply_markup if i == len(chunks) - 1 else None
+        await target.send_message(chunk, reply_markup=markup)
 
 
 # ─── Command Handlers ─────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👋 *War Snipers Donation Tracker*
-
-"
-        "Track clan donations across all War Snipers clans.
-"
-        "Tap a button below or type a command:")
-    await update.message.reply_text(text, reply_markup=build_menu_keyboard(), parse_mode="Markdown")
+    await update.message.reply_text(
+        "👋 *War Snipers Donation Tracker*\n\nTap a button to get started:",
+        reply_markup=build_menu_keyboard(),
+        parse_mode="Markdown",
+    )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "📖 *Commands:*
-
-"
-        "🏆 /donation — Top donators across all clans
-"
-        "📊 /clanlist — Donations grouped by each clan
-"
-        "📜 /lastseason — Last season's records (kept 2 weeks)
-"
-        "🔍 /checktags — Verify which clans I'm tracking
-"
-        "📋 /menu — Show the button menu
-
-"
-        f"ℹ️ Data syncs every {POLL_INTERVAL}s automatically.
-"
-        "ℹ️ Moving between tracked clans will NOT reset your count.")
+        "📖 *Commands:*\n\n"
+        "🏆 /donation — Combined leaderboard across all clans\n"
+        "📊 /clanlist — Donations grouped by each clan\n"
+        "📜 /lastseason — Last season's records (kept 2 weeks)\n"
+        "🔍 /checktags — Verify which clans I'm tracking\n"
+        "📋 /menu — Show button menu\n\n"
+        f"ℹ️ Syncs every {POLL_INTERVAL}s. Jumping between clans does NOT reset your count."
+    )
     if update.callback_query:
         await update.callback_query.answer()
         await update.callback_query.edit_message_text(
@@ -449,45 +522,33 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @group_only
 async def donation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    is_callback = bool(update.callback_query)
-    if is_callback:
+    is_cb = bool(update.callback_query)
+    if is_cb:
         await update.callback_query.answer("⏳ Fetching...")
     else:
-        await update.message.reply_text("⏳ Fetching global donation data...")
-
+        await update.message.reply_text("⏳ Fetching donation data...")
     try:
         clan_tags = await get_clan_tags_from_chat(update, context)
         if not clan_tags:
             msg = "❌ No clan tags found in group description."
-            if is_callback:
+            if is_cb:
                 await update.callback_query.edit_message_text(msg, reply_markup=build_menu_keyboard())
             else:
                 await update.message.reply_text(msg)
             return
-
         tracker.storage.cache_clan_tags(clan_tags)
         players = tracker.get_all_donations(clan_tags)
-        if not players:
-            msg = "❌ Could not fetch donation data."
-            if is_callback:
-                await update.callback_query.edit_message_text(msg, reply_markup=build_menu_keyboard())
-            else:
-                await update.message.reply_text(msg)
-            return
-
-        message = tracker.format_leaderboard(players)
-        if is_callback:
-            text = message[:4096]
-            await update.callback_query.edit_message_text(text, reply_markup=build_menu_keyboard())
-            if len(message) > 4096:
-                await _send_long_message(update.effective_chat, message[4096:])
+        msg = tracker.format_leaderboard(players)
+        if is_cb:
+            await update.callback_query.edit_message_text(msg[:4096], reply_markup=build_menu_keyboard())
+            if len(msg) > 4096:
+                await _send_chunks(update.effective_chat, msg[4096:])
         else:
-            await _send_long_message(update.effective_chat, message)
-
+            await _send_chunks(update.effective_chat, msg, reply_markup=build_menu_keyboard())
     except Exception as e:
-        logger.error(f"Error in /donation: {e}")
-        err = f"❌ Error: {str(e)}"
-        if is_callback:
+        logger.error(f"/donation error: {e}")
+        err = f"❌ Error: {e}"
+        if is_cb:
             await update.callback_query.edit_message_text(err, reply_markup=build_menu_keyboard())
         else:
             await update.message.reply_text(err)
@@ -495,53 +556,32 @@ async def donation(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @group_only
 async def clanlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    is_callback = bool(update.callback_query)
-    if is_callback:
+    is_cb = bool(update.callback_query)
+    if is_cb:
         await update.callback_query.answer("⏳ Fetching...")
     else:
         await update.message.reply_text("⏳ Fetching clan data...")
-
     try:
         clan_tags = await get_clan_tags_from_chat(update, context)
         if not clan_tags:
             msg = "❌ No clan tags found in group description."
-            if is_callback:
+            if is_cb:
                 await update.callback_query.edit_message_text(msg, reply_markup=build_menu_keyboard())
             else:
                 await update.message.reply_text(msg)
             return
-
         tracker.storage.cache_clan_tags(clan_tags)
-        message = tracker.format_by_clan(clan_tags)
-        if is_callback:
-            text = message[:4096]
-            await update.callback_query.edit_message_text(text, reply_markup=build_menu_keyboard())
-            if len(message) > 4096:
-                await _send_long_message(update.effective_chat, message[4096:])
+        msg = tracker.format_by_clan(clan_tags)
+        if is_cb:
+            await update.callback_query.edit_message_text(msg[:4096], reply_markup=build_menu_keyboard())
+            if len(msg) > 4096:
+                await _send_chunks(update.effective_chat, msg[4096:])
         else:
-            # Split on clan boundaries to avoid breaking mid-clan
-            if len(message) <= 4096:
-                await update.message.reply_text(message)
-            else:
-                parts, current = [], ""
-                for line in message.split("
-"):
-                    if len(current) + len(line) + 1 > 4096:
-                        parts.append(current.rstrip())
-                        current = line + "
-"
-                    else:
-                        current += line + "
-"
-                if current:
-                    parts.append(current.rstrip())
-                for part in parts:
-                    await update.message.reply_text(part)
-
+            await _send_chunks(update.effective_chat, msg, reply_markup=build_menu_keyboard())
     except Exception as e:
-        logger.error(f"Error in /clanlist: {e}")
-        err = f"❌ Error: {str(e)}"
-        if is_callback:
+        logger.error(f"/clanlist error: {e}")
+        err = f"❌ Error: {e}"
+        if is_cb:
             await update.callback_query.edit_message_text(err, reply_markup=build_menu_keyboard())
         else:
             await update.message.reply_text(err)
@@ -549,37 +589,28 @@ async def clanlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @group_only
 async def lastseason(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    is_callback = bool(update.callback_query)
-    if is_callback:
+    is_cb = bool(update.callback_query)
+    if is_cb:
         await update.callback_query.answer()
-
     try:
-        players, season, days_left = tracker.get_last_season_leaderboard()
+        players, season_label, days_left = tracker.storage.get_last_season()
         if players is None:
-            msg = (
-                "❌ No last season data available.
-"
-                "Records are kept for 2 weeks after the season ends."
-            )
-            if is_callback:
+            msg = "❌ No last season data available.\nRecords are kept for 2 weeks after season ends."
+            if is_cb:
                 await update.callback_query.edit_message_text(msg, reply_markup=build_menu_keyboard())
             else:
                 await update.message.reply_text(msg)
             return
-
-        title = f"📜 Last Season ({season}) Final Donations 📜
-⏳ Records expire in {days_left} day(s)"
-        message = tracker.format_leaderboard(players, title=title)
-        if is_callback:
-            text = message[:4096]
-            await update.callback_query.edit_message_text(text, reply_markup=build_menu_keyboard())
+        title = f"📜 Last Season ({season_label}) Final Donations 📜\n⏳ Expires in {days_left} day(s)"
+        msg = tracker.format_leaderboard(players, title=title)
+        if is_cb:
+            await update.callback_query.edit_message_text(msg[:4096], reply_markup=build_menu_keyboard())
         else:
-            await _send_long_message(update.effective_chat, message)
-
+            await _send_chunks(update.effective_chat, msg, reply_markup=build_menu_keyboard())
     except Exception as e:
-        logger.error(f"Error in /lastseason: {e}")
-        err = f"❌ Error: {str(e)}"
-        if is_callback:
+        logger.error(f"/lastseason error: {e}")
+        err = f"❌ Error: {e}"
+        if is_cb:
             await update.callback_query.edit_message_text(err, reply_markup=build_menu_keyboard())
         else:
             await update.message.reply_text(err)
@@ -587,61 +618,55 @@ async def lastseason(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @group_only
 async def checktags(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    is_callback = bool(update.callback_query)
-    if is_callback:
+    is_cb = bool(update.callback_query)
+    if is_cb:
         await update.callback_query.answer("🔍 Checking...")
-
     try:
         clan_tags = await get_clan_tags_from_chat(update, context)
         if not clan_tags:
             msg = "❌ No clan tags found in group description."
-            if is_callback:
+            if is_cb:
                 await update.callback_query.edit_message_text(msg, reply_markup=build_menu_keyboard())
             else:
                 await update.message.reply_text(msg)
             return
-
         lines = ["📋 *Detected Clan Tags:*", ""]
         for tag in clan_tags:
-            clan_info = tracker.api.get_clan_info(tag)
-            name = clan_info.get("name", "Unknown") if clan_info else "❌ Unreachable"
+            info = tracker.api.get_clan_info(tag)
+            name = info.get("name", "Unknown") if info else "❌ Unreachable"
             lines.append(f"▫️ {tag} — {name}")
-        text = "
-".join(lines)
-
-        if is_callback:
+        text = "\n".join(lines)
+        if is_cb:
             await update.callback_query.edit_message_text(
                 text, reply_markup=build_menu_keyboard(), parse_mode="Markdown"
             )
         else:
             await update.message.reply_text(text, parse_mode="Markdown")
-
     except Exception as e:
-        logger.error(f"Error in /checktags: {e}")
-        err = f"❌ Error: {str(e)}"
-        if is_callback:
+        logger.error(f"/checktags error: {e}")
+        err = f"❌ Error: {e}"
+        if is_cb:
             await update.callback_query.edit_message_text(err, reply_markup=build_menu_keyboard())
         else:
             await update.message.reply_text(err)
 
 
-# ─── Callback Query Router ────────────────────────────────────────────────────
+# ─── Callback Router ──────────────────────────────────────────────────────────
 
 CALLBACK_MAP = {
-    "donation": donation,
-    "clanlist": clanlist,
+    "donation":   donation,
+    "clanlist":   clanlist,
     "lastseason": lastseason,
-    "checktags": checktags,
+    "checktags":  checktags,
 }
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    handler = CALLBACK_MAP.get(query.data)
+    handler = CALLBACK_MAP.get(update.callback_query.data)
     if handler:
         await handler(update, context)
     else:
-        await query.answer("Unknown action.")
+        await update.callback_query.answer("Unknown action.")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -649,7 +674,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     telegram_token = os.getenv("TELEGRAM_TOKEN")
     coc_api_token = os.getenv("COC_API_TOKEN")
-
     if not telegram_token or not coc_api_token:
         logger.error("Missing TELEGRAM_TOKEN or COC_API_TOKEN environment variables.")
         return
@@ -657,22 +681,23 @@ def main():
     global tracker
     tracker = DonationTracker(coc_api_token)
 
-    application = Application.builder().token(telegram_token).build()
+    app = Application.builder().token(telegram_token).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("menu", menu))
-    application.add_handler(CommandHandler("donation", donation))
-    application.add_handler(CommandHandler("clanlist", clanlist))
-    application.add_handler(CommandHandler("lastseason", lastseason))
-    application.add_handler(CommandHandler("checktags", checktags))
-    application.add_handler(CallbackQueryHandler(button_handler))
+    for cmd, fn in [
+        ("start",      start),
+        ("help",       help_cmd),
+        ("menu",       menu),
+        ("donation",   donation),
+        ("clanlist",   clanlist),
+        ("lastseason", lastseason),
+        ("checktags",  checktags),
+    ]:
+        app.add_handler(CommandHandler(cmd, fn))
+    app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Poll CoC API every POLL_INTERVAL seconds, starting 5 seconds after launch
-    application.job_queue.run_repeating(background_sync, interval=POLL_INTERVAL, first=5)
-
-    logger.info(f"Bot started. Background sync every {POLL_INTERVAL}s.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.job_queue.run_repeating(background_sync, interval=POLL_INTERVAL, first=5)
+    logger.info(f"Bot started. Syncing every {POLL_INTERVAL}s.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
