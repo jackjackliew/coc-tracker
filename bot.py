@@ -83,15 +83,15 @@ class DonationStorage:
             try:
                 with open(STORAGE_FILE, "r") as f:
                     data = json.load(f)
-                # Migrate old format: "season": "2026-04" → "season_key": "20260401"
+                # Migrate old format: "season": "2026-04" → "season_key": ""
+                # We leave season_key empty so the goldpass API sets the exact
+                # CoC season start date on first sync. If we guessed "YYYY MM 01"
+                # it might not match the real goldpass key (CoC seasons start on
+                # the last Monday of the previous month, not the calendar 1st).
                 if "season" in data and "season_key" not in data:
-                    old = data.pop("season", "")
-                    try:
-                        year, month = old.split("-")
-                        data["season_key"] = f"{year}{month}01"
-                    except Exception:
-                        data["season_key"] = datetime.now().strftime("%Y%m01")
-                    logger.info(f"Storage migrated to season_key: {data['season_key']}")
+                    data.pop("season")
+                    data["season_key"] = ""  # Will be set correctly by goldpass on first sync
+                    logger.info("Storage migrated: season_key will be set from goldpass on first sync")
                 return data
             except Exception as e:
                 logger.error(f"Failed to load storage, starting fresh: {e}")
@@ -115,12 +115,26 @@ class DonationStorage:
         Called with the current CoC season key (from goldpass API or fallback).
         If the key has changed, snapshot the old season and start fresh.
         No-op if season key is unchanged — safe to call on every sync.
+
+        Special case: if season_key is empty (fresh install or migration from
+        old format), just set the key without wiping any player data.
         """
-        if self.data.get("season_key") == new_season_key:
+        stored_key = self.data.get("season_key", "")
+
+        if stored_key == new_season_key:
             return  # Same season — nothing to do
 
-        old_key = self.data.get("season_key", "none")
-        logger.info(f"Season changed: {old_key} → {new_season_key}. Snapshotting...")
+        if not stored_key:
+            # First time setting the key (fresh install or post-migration).
+            # Just record the season key — do NOT reset player data.
+            logger.info(f"Season key initialized: {new_season_key}")
+            self.data["season_key"] = new_season_key
+            self._dirty = True
+            self.flush()
+            return
+
+        # Season key changed — real season rollover. Snapshot and reset.
+        logger.info(f"Season changed: {stored_key} → {new_season_key}. Snapshotting...")
 
         if self.data.get("players"):
             self._snapshot_to_last_season()
@@ -131,7 +145,7 @@ class DonationStorage:
             "players": {},
         }
         self._dirty = True
-        self.flush()  # Immediate flush on season change
+        self.flush()
 
     def _snapshot_to_last_season(self):
         """Save final season totals to last_season_storage.json (kept 2 weeks)."""
@@ -243,11 +257,15 @@ class DonationStorage:
                 [{"name": v["name"], "donations": v["total"]} for v in data["players"].values()],
                 key=lambda x: x["donations"], reverse=True,
             )
-            season_key = data.get("season_key", "")
+            # Support both new "season_key" and old "season" field formats
+            season_key = data.get("season_key") or data.get("season", "")
             try:
                 season_label = datetime.strptime(season_key, "%Y%m%d").strftime("%B %Y")
             except Exception:
-                season_label = season_key
+                try:
+                    season_label = datetime.strptime(season_key, "%Y-%m").strftime("%B %Y")
+                except Exception:
+                    season_label = season_key or "Unknown"
             days_left = max(0, (expires_at - datetime.now()).days)
             return players, season_label, days_left
         except Exception as e:
