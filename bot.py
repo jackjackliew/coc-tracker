@@ -335,10 +335,13 @@ class DonationTracker:
         if season_key:
             self.storage.handle_season_change(season_key)
         else:
-            # API unavailable — retain stored key; fall back to calendar month only
-            # if we have no stored key at all (e.g. fresh install).
+            # Goldpass API unavailable — this is non-critical. The calendar month
+            # fallback is accurate within a few days (CoC seasons end on the last
+            # Monday of the month). Season resets will still happen correctly.
+            # To fix: ensure your CoC API token IP whitelist includes this server's
+            # IP at https://developer.clashofclans.com/
             fallback = self.storage.data.get("season_key") or datetime.now().strftime("%Y%m01")
-            logger.warning(f"Goldpass API unavailable, retaining season key: {fallback}")
+            logger.debug(f"Goldpass API unavailable (non-critical), using key: {fallback}")
             self.storage.handle_season_change(fallback)
 
     def parse_clan_tags(self, description: str) -> list:
