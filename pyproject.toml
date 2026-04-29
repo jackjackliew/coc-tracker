@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coc-tracker"
+version = "2.0.0"
+description = "Cross-clan donation tracker for Clash of Clans clan families on Telegram"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Jack Liew" }]
+requires-python = ">=3.10"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Games/Entertainment",
+  "Topic :: Communications :: Chat",
+]
+dependencies = [
+  "python-telegram-bot[job-queue]==22.7",
+  "httpx[http2]==0.28.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.3.4",
+  "pytest-asyncio==0.24.0",
+  "ruff==0.8.4",
+  "mypy==1.13.0",
+]
+
+[project.scripts]
+coc-tracker = "coc_tracker.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/jackjackliew/coc-tracker"
+Issues = "https://github.com/jackjackliew/coc-tracker/issues"
+
+[tool.setuptools.packages.find]
+include = ["coc_tracker*"]
+
+[tool.setuptools.package-data]
+coc_tracker = ["py.typed"]
+
+# ─── Ruff ──────────────────────────────────────────────────────────────────────
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "W",   # pycodestyle warnings
+  "F",   # pyflakes
+  "I",   # isort
+  "B",   # bugbear
+  "UP",  # pyupgrade
+  "N",   # pep8-naming
+  "SIM", # simplify
+]
+ignore = [
+  "E501",  # line too long — handled by formatter
+  "B008",  # function call in default argument (allowed for httpx clients etc.)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501", "N"]
+
+# ─── Mypy ──────────────────────────────────────────────────────────────────────
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+warn_return_any = true
+warn_unused_ignores = true
+no_implicit_optional = true
+ignore_missing_imports = true  # advisory until full stub coverage
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true
+
+# ─── Pytest ────────────────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+asyncio_mode = "auto"
