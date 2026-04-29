@@ -1,0 +1,17 @@
+services:
+  coc-tracker:
+    build: .
+    container_name: coc-tracker
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist donation history across container restarts.
+      # First boot will read existing donation_storage.json from the host.
+      - ./donation_storage.json:/app/donation_storage.json
+      - ./last_season_storage.json:/app/last_season_storage.json
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

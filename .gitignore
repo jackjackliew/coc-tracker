@@ -1,8 +1,32 @@
+# Secrets
 .env
+.env.local
+
+# Storage (local runs only — production lives on the VM)
 donation_storage.json
 last_season_storage.json
+*.json.tmp
+
+# Python
 __pycache__/
-*.pyc
-*.pyo
-venv/
+*.py[cod]
+*$py.class
+*.so
+.Python
 .venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
