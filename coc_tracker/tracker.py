@@ -102,7 +102,9 @@ class DonationTracker:
         except Exception:
             return last_sync
 
-    def format_leaderboard(self, players: list, title: str = "🏆 Top Donators This Season 🏆") -> str:
+    def format_leaderboard(
+        self, players: list, title: str = "🏆 Top Donators This Season 🏆"
+    ) -> str:
         if not players:
             return "❌ No donation data yet. Sync runs every 10s — try again shortly."
         medals = {1: "🥇", 2: "🥈", 3: "🥉"}

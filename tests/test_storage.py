@@ -11,7 +11,6 @@ from pathlib import Path
 
 from coc_tracker.storage import DonationStorage
 
-
 # ─── v1 backward compatibility ────────────────────────────────────────────────
 
 
@@ -156,9 +155,7 @@ def test_expired_last_season_cleared_on_read(tmp_path: Path):
     last_season_file = tmp_path / "last_season_storage.json"
     expired = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
     last_season_file.write_text(
-        json.dumps(
-            {"season_key": "20260301", "expires_at": expired, "players": {}}
-        )
+        json.dumps({"season_key": "20260301", "expires_at": expired, "players": {}})
     )
     s = DonationStorage(str(storage_file), str(last_season_file))
     players, season_label, days_left = s.get_last_season()

@@ -26,7 +26,8 @@ import logging
 import os
 from datetime import datetime, timedelta
 
-from .config import LAST_SEASON_FILE, LAST_SEASON_RETENTION_DAYS, STORAGE_FILE
+from . import config
+from .config import LAST_SEASON_RETENTION_DAYS
 
 logger = logging.getLogger(__name__)
 
@@ -34,16 +35,18 @@ logger = logging.getLogger(__name__)
 class DonationStorage:
     """Manages all donation state on disk. Schema is v1-compatible."""
 
-    def __init__(self, storage_file: str = STORAGE_FILE, last_season_file: str = LAST_SEASON_FILE):
-        self.storage_file = storage_file
-        self.last_season_file = last_season_file
+    def __init__(self, storage_file: str | None = None, last_season_file: str | None = None):
+        # Resolve at construction time (not import time) so env var overrides
+        # set by tests / monkeypatches / late os.environ updates take effect.
+        self.storage_file = storage_file or config.STORAGE_FILE
+        self.last_season_file = last_season_file or config.LAST_SEASON_FILE
         self.data = self._load()
         self._dirty = False
 
     def _load(self) -> dict:
         if os.path.exists(self.storage_file):
             try:
-                with open(self.storage_file, "r") as f:
+                with open(self.storage_file) as f:
                     data = json.load(f)
                 # Migrate old "season" key to "season_key" (v0 → v1 compat, kept for safety)
                 if "season" in data and "season_key" not in data:
@@ -192,7 +195,9 @@ class DonationStorage:
                 # Same clan, count dropped — left and rejoined (CoC resets to 0)
                 p["bonus"] += p["last_donations"]
                 p["last_donations"] = current_donations
-                logger.info(f"[REJOIN] {player_name} back to {current_clan_tag} | bonus={p['bonus']}")
+                logger.info(
+                    f"[REJOIN] {player_name} back to {current_clan_tag} | bonus={p['bonus']}"
+                )
                 changed = True
             elif current_donations != p["last_donations"]:
                 p["last_donations"] = current_donations
@@ -242,7 +247,7 @@ class DonationStorage:
         if not os.path.exists(self.last_season_file):
             return None, None, None
         try:
-            with open(self.last_season_file, "r") as f:
+            with open(self.last_season_file) as f:
                 data = json.load(f)
             expires_at = datetime.strptime(data["expires_at"], "%Y-%m-%dT%H:%M:%S")
             if datetime.now() >= expires_at:

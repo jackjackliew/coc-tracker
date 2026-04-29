@@ -49,8 +49,7 @@ async def get_clan_tags_from_chat(update: Update, context: ContextTypes.DEFAULT_
 
 async def _send_chunks(target, text: str, reply_markup=None) -> None:
     chunks = [
-        text[i : i + TELEGRAM_MESSAGE_LIMIT]
-        for i in range(0, len(text), TELEGRAM_MESSAGE_LIMIT)
+        text[i : i + TELEGRAM_MESSAGE_LIMIT] for i in range(0, len(text), TELEGRAM_MESSAGE_LIMIT)
     ]
     for i, chunk in enumerate(chunks):
         markup = reply_markup if i == len(chunks) - 1 else None
@@ -153,7 +152,9 @@ async def donation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if is_cb:
             await _edit_message(
-                update.callback_query, msg[:TELEGRAM_MESSAGE_LIMIT], reply_markup=build_menu_keyboard()
+                update.callback_query,
+                msg[:TELEGRAM_MESSAGE_LIMIT],
+                reply_markup=build_menu_keyboard(),
             )
             if len(msg) > TELEGRAM_MESSAGE_LIMIT:
                 await _send_chunks(update.effective_chat, msg[TELEGRAM_MESSAGE_LIMIT:])
@@ -208,7 +209,9 @@ async def clanlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if is_cb:
             await _edit_message(
-                update.callback_query, msg[:TELEGRAM_MESSAGE_LIMIT], reply_markup=build_menu_keyboard()
+                update.callback_query,
+                msg[:TELEGRAM_MESSAGE_LIMIT],
+                reply_markup=build_menu_keyboard(),
             )
             if len(msg) > TELEGRAM_MESSAGE_LIMIT:
                 await _send_chunks(update.effective_chat, msg[TELEGRAM_MESSAGE_LIMIT:])
@@ -233,7 +236,9 @@ async def lastseason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         players, season_label, days_left = tracker.storage.get_last_season()
         if players is None:
-            msg = "❌ No last season data available.\nRecords are kept for 2 weeks after season ends."
+            msg = (
+                "❌ No last season data available.\nRecords are kept for 2 weeks after season ends."
+            )
             if is_cb:
                 await update.callback_query.edit_message_text(
                     msg, reply_markup=build_menu_keyboard()
@@ -242,12 +247,16 @@ async def lastseason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 await update.message.reply_text(msg)
             return
 
-        title = f"📜 Last Season ({season_label}) Final Donations 📜\n⏳ Expires in {days_left} day(s)"
+        title = (
+            f"📜 Last Season ({season_label}) Final Donations 📜\n⏳ Expires in {days_left} day(s)"
+        )
         msg = tracker.format_leaderboard(players, title=title)
 
         if is_cb:
             await _edit_message(
-                update.callback_query, msg[:TELEGRAM_MESSAGE_LIMIT], reply_markup=build_menu_keyboard()
+                update.callback_query,
+                msg[:TELEGRAM_MESSAGE_LIMIT],
+                reply_markup=build_menu_keyboard(),
             )
         else:
             await _send_chunks(update.effective_chat, msg, reply_markup=build_menu_keyboard())
@@ -288,7 +297,10 @@ async def checktags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if is_cb:
             await _edit_message(
-                update.callback_query, text, reply_markup=build_menu_keyboard(), parse_mode="Markdown"
+                update.callback_query,
+                text,
+                reply_markup=build_menu_keyboard(),
+                parse_mode="Markdown",
             )
         else:
             await update.message.reply_text(text, parse_mode="Markdown")

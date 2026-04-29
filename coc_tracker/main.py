@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
 from telegram import Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler
 
+from .backup import BACKUP_INTERVAL_HOURS, backup_job
 from .config import POLL_INTERVAL
 from .handlers import (
     background_sync,
@@ -54,15 +56,21 @@ def main() -> None:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(CallbackQueryHandler(button_handler))
 
+    # Background donation sync
     app.job_queue.run_repeating(background_sync, interval=POLL_INTERVAL, first=5)
-    logger.info(f"Bot started. Syncing every {POLL_INTERVAL}s.")
+
+    # Defence-in-depth: periodic JSON snapshots of the live storage
+    backup_seconds = max(BACKUP_INTERVAL_HOURS * 3600, 600)
+    app.job_queue.run_repeating(backup_job, interval=backup_seconds, first=backup_seconds)
+
+    logger.info(
+        f"Bot started. Syncing every {POLL_INTERVAL}s. " f"Backups every {BACKUP_INTERVAL_HOURS}h."
+    )
 
     try:
         app.run_polling(allowed_updates=Update.ALL_TYPES)
     finally:
         # Best-effort cleanup of the async HTTP client
-        import asyncio
-
         try:
             loop = asyncio.new_event_loop()
             loop.run_until_complete(tracker.aclose())
