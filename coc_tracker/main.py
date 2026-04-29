@@ -32,12 +32,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _quiet_third_party_logs() -> None:
+    """Reduce log volume from libraries that log every operation at INFO level.
+
+    On a free-tier VM with capped journald (50–100 MB), httpx+apscheduler INFO
+    logs at 10s sync cadence balloon the journal by ~17 MB/day. Promoting them
+    to WARNING drops journal growth to ~2 MB/day with no operational loss
+    (errors still surface; sync success is observable via `coc-tracker stats`).
+
+    Override with `LOG_VERBOSE_LIBS=1` if you need request-by-request tracing.
+    """
+    if os.getenv("LOG_VERBOSE_LIBS", "0") == "1":
+        return
+    for noisy in ("httpx", "httpcore", "apscheduler", "telegram.ext.Application"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 def main() -> None:
     telegram_token = os.getenv("TELEGRAM_TOKEN")
     coc_api_token = os.getenv("COC_API_TOKEN")
     if not telegram_token or not coc_api_token:
         logger.error("Missing TELEGRAM_TOKEN or COC_API_TOKEN environment variables.")
         return
+
+    _quiet_third_party_logs()
 
     tracker = DonationTracker(coc_api_token)
     set_tracker(tracker)
@@ -64,7 +82,7 @@ def main() -> None:
     app.job_queue.run_repeating(backup_job, interval=backup_seconds, first=backup_seconds)
 
     logger.info(
-        f"Bot started. Syncing every {POLL_INTERVAL}s. " f"Backups every {BACKUP_INTERVAL_HOURS}h."
+        f"Bot started. Syncing every {POLL_INTERVAL}s. Backups every {BACKUP_INTERVAL_HOURS}h."
     )
 
     try:
