@@ -77,6 +77,12 @@ class DonationStorage:
         stored_key = self.data.get("season_key", "")
         if stored_key == new_season_key:
             return
+        if stored_key and new_season_key < stored_key:
+            logger.warning(
+                f"Ignoring backward season change: {stored_key} → {new_season_key} "
+                "(API may be returning stale data)"
+            )
+            return
         if not stored_key:
             logger.info(f"Season key initialized: {new_season_key}")
             self.data["season_key"] = new_season_key

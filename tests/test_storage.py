@@ -139,6 +139,22 @@ def test_first_season_init_no_snapshot(tmp_storage: DonationStorage):
     assert not Path(s.last_season_file).exists()
 
 
+def test_backward_season_change_ignored(tmp_storage_with_v1_data: DonationStorage):
+    """A backward season key (e.g. stale API response after manual rollover) must NOT
+    trigger a snapshot+reset — that would overwrite a real archive with empty data
+    and wipe live player records."""
+    s = tmp_storage_with_v1_data
+    # Stored is 20260401 from the v1 fixture — try to "go back" to March
+    before_players = dict(s.data["players"])
+    before_key = s.data["season_key"]
+
+    s.handle_season_change("20260301")  # backward jump
+
+    assert s.data["season_key"] == before_key, "stored key was mutated by backward jump"
+    assert s.data["players"] == before_players, "players were reset by backward jump"
+    assert not Path(s.last_season_file).exists(), "snapshot wrongly written for backward jump"
+
+
 def test_get_last_season_returns_sorted_with_days_left(tmp_storage_with_v1_data: DonationStorage):
     s = tmp_storage_with_v1_data
     s.handle_season_change("20260501")  # writes snapshot
