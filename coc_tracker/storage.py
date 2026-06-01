@@ -130,6 +130,33 @@ class DonationStorage:
         except Exception as e:
             logger.error(f"Failed to write season snapshot: {e}")
 
+    def reset_to_zero(self, archive: bool = True) -> int:
+        """On-demand leaderboard reset (the /reset command).
+
+        Archives the current standings to ``last_season_storage.json`` (so they
+        remain viewable via /lastseason for the retention window), then zeroes
+        every player's total by setting ``bonus = -last_donations``.
+
+        ``last_donations`` is deliberately left untouched: future syncs then
+        accumulate as deltas from zero, and the next in-game league reset hits
+        the ``[REJOIN]`` path in :meth:`update_player` (``bonus += last_donations``
+        → ``-X + X = 0``), so totals stay clean rather than going negative.
+
+        ``season_key`` is NOT changed — this is a manual reset, not a season
+        rollover — so the bot's poll loop produces no backward-jump warnings.
+
+        Returns the number of players reset.
+        """
+        if archive and self.data.get("players"):
+            self._snapshot_to_last_season()
+        players = self.data.get("players", {})
+        for p in players.values():
+            p["bonus"] = -p.get("last_donations", 0)
+        self._dirty = True
+        self.flush()
+        logger.info(f"Manual reset: zeroed {len(players)} players (archive={archive})")
+        return len(players)
+
     # ── Clan tags & names ──────────────────────────────────────────────────────
 
     def cache_clan_tags(self, clan_tags: list) -> None:

@@ -9,6 +9,7 @@ from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
+from .backup import make_backup
 from .config import POLL_INTERVAL, TELEGRAM_MESSAGE_LIMIT
 from .keyboard import build_menu_keyboard
 from .tracker import DonationTracker
@@ -37,6 +38,45 @@ def group_only(func):
             elif update.message:
                 await update.message.reply_text(msg)
             return
+        await func(update, context)
+
+    return wrapper
+
+
+def group_admin_only(func):
+    """Restrict a command to administrators of the current group.
+
+    Destructive commands (e.g. /reset) use this. Only works in a group/supergroup
+    — there is no admin concept in a private chat — and only for users Telegram
+    reports as chat administrators. Anyone else gets a polite refusal and the
+    wrapped handler never runs.
+    """
+
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat = update.effective_chat
+        chat_type = chat.type if chat else None
+        if chat_type not in ["group", "supergroup"]:
+            if update.message:
+                await update.message.reply_text(
+                    "❌ This command only works in the War Snipers group."
+                )
+            return
+
+        user = update.effective_user
+        try:
+            admins = await context.bot.get_chat_administrators(chat.id)
+            admin_ids = {a.user.id for a in admins}
+        except Exception as e:
+            logger.error(f"Failed to fetch chat admins: {e}")
+            if update.message:
+                await update.message.reply_text("❌ Couldn't verify admin status. Try again.")
+            return
+
+        if not user or user.id not in admin_ids:
+            if update.message:
+                await update.message.reply_text("🚫 Only group admins can use this command.")
+            return
+
         await func(update, context)
 
     return wrapper
@@ -103,7 +143,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📊 /clanlist — Donations grouped by each clan\n"
         "📜 /lastseason — Last season's records (kept 2 weeks)\n"
         "🔍 /checktags — Verify which clans I'm tracking\n"
-        "📋 /menu — Show button menu\n\n"
+        "📋 /menu — Show button menu\n"
+        "♻️ /reset — Reset all donations to 0 (group admins only)\n\n"
         f"ℹ️ Syncs every {POLL_INTERVAL}s. Jumping between clans does NOT reset your count."
     )
     if update.callback_query:
@@ -312,6 +353,36 @@ async def checktags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _edit_message(update.callback_query, err, reply_markup=build_menu_keyboard())
         else:
             await update.message.reply_text(err)
+
+
+@group_admin_only
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reset every player's donation total to 0 (admins only, group only).
+
+    Current standings are first archived to /lastseason (kept 2 weeks), then a
+    safety JSON backup is taken, then totals are zeroed. One-shot, no confirm —
+    the admin gate + the deliberate slash command + automatic backups are the
+    safeguards.
+    """
+    try:
+        # Safety backup BEFORE mutating (defence-in-depth on top of the archive).
+        try:
+            make_backup()
+        except Exception as e:
+            logger.warning(f"/reset pre-mutation backup failed (continuing): {e}")
+
+        count = tracker.storage.reset_to_zero(archive=True)
+
+        user = update.effective_user
+        logger.info(f"[RESET] Leaderboard zeroed by {user.id} (@{user.username}) — {count} players")
+        msg = (
+            f"✅ *Donation leaderboard reset to 0* for all {count} players.\n\n"
+            "Previous standings were saved — view them anytime with /lastseason (kept 2 weeks)."
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"/reset error: {e}")
+        await update.message.reply_text(f"❌ Error during reset: {e}")
 
 
 # ─── Callback Router ──────────────────────────────────────────────────────────

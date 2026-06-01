@@ -20,6 +20,7 @@ from .handlers import (
     help_cmd,
     lastseason,
     menu,
+    reset,
     set_tracker,
     start,
 )
@@ -70,6 +71,7 @@ def main() -> None:
         ("clanlist", clanlist),
         ("lastseason", lastseason),
         ("checktags", checktags),
+        ("reset", reset),
     ]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(CallbackQueryHandler(button_handler))

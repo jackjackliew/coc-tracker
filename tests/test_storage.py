@@ -179,6 +179,65 @@ def test_expired_last_season_cleared_on_read(tmp_path: Path):
     assert not last_season_file.exists()
 
 
+# ─── Manual reset (on-demand /reset command) ──────────────────────────────────
+
+
+def test_reset_to_zero_archives_and_zeros(tmp_storage_with_v1_data: DonationStorage):
+    """reset_to_zero archives current standings to last-season, then zeros every
+    player's total via bonus = -last_donations, WITHOUT changing season_key."""
+    s = tmp_storage_with_v1_data
+    before_key = s.data["season_key"]
+
+    count = s.reset_to_zero(archive=True)
+
+    assert count == 2
+    # Archive written with the CURRENT season's pre-reset totals
+    snap_path = Path(s.last_season_file)
+    assert snap_path.exists()
+    snap = json.loads(snap_path.read_text())
+    assert snap["season_key"] == "20260401"
+    assert snap["players"]["#P1"]["total"] == 600  # 500 bonus + 100 last_donations
+    assert snap["players"]["#P2"]["total"] == 250
+
+    # Every player now totals 0, season_key untouched, players NOT deleted
+    assert s.data["season_key"] == before_key
+    assert set(s.data["players"]) == {"#P1", "#P2"}
+    assert all(p["donations"] == 0 for p in s.get_all_players_sorted())
+    # last_donations preserved so future syncs accumulate as deltas
+    assert s.data["players"]["#P1"]["last_donations"] == 100
+    assert s.data["players"]["#P1"]["bonus"] == -100
+
+
+def test_reset_to_zero_then_new_donations_accumulate_from_zero(
+    tmp_storage_with_v1_data: DonationStorage,
+):
+    """After a reset, fresh donations count from 0 (delta), not from the pre-reset total."""
+    s = tmp_storage_with_v1_data
+    s.reset_to_zero(archive=True)
+    # Alice (last_donations 100, same clan) donates more → API now reports 150
+    total = s.update_player("#P1", "Alice", 150, "#ABC123")
+    assert total == 50  # -100 bonus + 150 = 50 donated since reset
+
+
+def test_reset_to_zero_survives_next_league_reset(tmp_storage_with_v1_data: DonationStorage):
+    """After reset, an in-game league reset (API drops to 0) must leave total at 0,
+    not go negative — the [REJOIN] path zeroes the negative bonus cleanly."""
+    s = tmp_storage_with_v1_data
+    s.reset_to_zero(archive=True)
+    # League reset: API donations for Alice drop from 100 → 0, same clan
+    total = s.update_player("#P1", "Alice", 0, "#ABC123")
+    assert total == 0
+    assert s.data["players"]["#P1"]["bonus"] == 0
+    assert s.data["players"]["#P1"]["last_donations"] == 0
+
+
+def test_reset_to_zero_without_archive_skips_snapshot(tmp_storage_with_v1_data: DonationStorage):
+    s = tmp_storage_with_v1_data
+    s.reset_to_zero(archive=False)
+    assert not Path(s.last_season_file).exists()
+    assert all(p["donations"] == 0 for p in s.get_all_players_sorted())
+
+
 # ─── Clan ops ─────────────────────────────────────────────────────────────────
 
 
