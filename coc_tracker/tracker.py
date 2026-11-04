@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from .api import ClashAPI
-from .config import CLAN_NAME_REFRESH, SEASON_CHECK_INTERVAL
+from .config import CLAN_NAME_REFRESH, DISPLAY_TZ, SEASON_CHECK_INTERVAL
 from .storage import DonationStorage
 
 logger = logging.getLogger(__name__)
@@ -96,9 +97,9 @@ class DonationTracker:
         try:
             sync_dt = datetime.strptime(last_sync, "%Y-%m-%dT%H:%M:%S")
             secs = int((datetime.now() - sync_dt).total_seconds())
-            if secs < 60:
-                return f"Synced {secs}s ago"
-            return f"Synced {secs // 60}m ago"
+            ago = f"{secs}s" if secs < 60 else f"{secs // 60}m"
+            stamp = datetime.now(ZoneInfo(DISPLAY_TZ)).strftime("%-d %b %Y, %-I:%M %p")
+            return f"Synced {ago} ago · {stamp}"
         except Exception:
             return last_sync
 

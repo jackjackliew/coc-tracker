@@ -24,3 +24,8 @@ HTTP_TIMEOUT = float(os.getenv("COC_HTTP_TIMEOUT", "10"))
 
 TELEGRAM_MESSAGE_LIMIT = 4096
 LAST_SEASON_RETENTION_DAYS = int(os.getenv("COC_LAST_SEASON_RETENTION_DAYS", "14"))
+# Button taps on bot messages older than this post a fresh reply instead of
+# editing in place — Telegram keeps an edited message's original send date.
+STALE_MESSAGE_SECONDS = int(os.getenv("COC_STALE_MESSAGE_SECONDS", "300"))
+# Timezone for the date shown in message footers (the clan is in Malaysia).
+DISPLAY_TZ = os.getenv("COC_DISPLAY_TZ", "Asia/Kuala_Lumpur")

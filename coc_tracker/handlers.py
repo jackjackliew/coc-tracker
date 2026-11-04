@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from .backup import make_backup
-from .config import POLL_INTERVAL, TELEGRAM_MESSAGE_LIMIT
+from .config import POLL_INTERVAL, STALE_MESSAGE_SECONDS, TELEGRAM_MESSAGE_LIMIT
 from .keyboard import build_menu_keyboard
 from .tracker import DonationTracker
 
@@ -96,14 +96,36 @@ async def _send_chunks(target, text: str, reply_markup=None) -> None:
         await target.send_message(chunk, reply_markup=markup)
 
 
+def _is_stale(message) -> bool:
+    """True if the tapped message is too old to refresh in place.
+
+    Telegram keeps an edited message's original send date, so refreshing an old
+    reply makes live data look like it is from that day. Inaccessible messages
+    (older than 48h) report a date of epoch 0, so they always count as stale.
+    """
+    sent: datetime | None = getattr(message, "date", None)
+    if sent is None:
+        return False
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - sent).total_seconds() > STALE_MESSAGE_SECONDS
+
+
 async def _edit_message(query, text: str, reply_markup=None, parse_mode=None) -> None:
-    """Edit a callback message. Silently ignores Telegram's 'not modified' error."""
+    """Edit a callback message, or post a fresh one if the tapped message is old.
+
+    Silently ignores Telegram's 'not modified' error.
+    """
     try:
         kwargs = {}
         if reply_markup:
             kwargs["reply_markup"] = reply_markup
         if parse_mode:
             kwargs["parse_mode"] = parse_mode
+        message = getattr(query, "message", None)
+        if message is not None and _is_stale(message):
+            await message.chat.send_message(text, **kwargs)
+            return
         await query.edit_message_text(text, **kwargs)
     except BadRequest as e:
         if "not modified" in str(e).lower():
